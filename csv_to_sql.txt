@@ -1,0 +1,119 @@
+import pandas as pd
+import mysql.connector
+import os
+import logging
+from time import sleep
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# List of CSV files and their corresponding table names
+csv_files = [
+    ('customers.csv', 'customers'),
+    ('orders.csv', 'orders'),
+    ('sellers.csv', 'sellers'),
+    ('products.csv', 'products'),
+    ('geolocation.csv', 'geolocation'),
+    ('payments.csv', 'payments'),
+    ('order_items.csv', 'order_items')
+]
+
+# Folder containing the CSV files
+folder_path = r'D:\Eco_python_sql\data_set'
+
+def get_sql_type(dtype):
+    """Map pandas dtypes to MySQL data types."""
+    if pd.api.types.is_integer_dtype(dtype):
+        return 'BIGINT'
+    elif pd.api.types.is_float_dtype(dtype):
+        return 'DOUBLE'
+    elif pd.api.types.is_bool_dtype(dtype):
+        return 'TINYINT(1)'
+    elif pd.api.types.is_datetime64_any_dtype(dtype):
+        return 'DATETIME'
+    elif dtype.name == 'object':
+        return 'VARCHAR(255)'
+    else:
+        return 'TEXT'
+
+def create_connection(retries=3, delay=5):
+    """Create a connection to the MySQL database with retry mechanism."""
+    for attempt in range(retries):
+        try:
+            return mysql.connector.connect(
+                host='127.0.0.1',
+                user='amar',
+                password='amar',
+                database='ecommerce'
+            )
+        except mysql.connector.Error as err:
+            logging.error(f"Connection attempt {attempt + 1} failed: {err}")
+            if attempt < retries - 1:
+                sleep(delay)
+            else:
+                raise
+
+def validate_table_schema(cursor, table_name, df):
+    """Validate the table schema matches the DataFrame."""
+    cursor.execute(f"DESCRIBE `{table_name}`")
+    table_schema = {row[0]: row[1] for row in cursor.fetchall()}
+    df_schema = {col: get_sql_type(dtype) for col, dtype in df.dtypes.items()}
+    
+    for col, sql_type in df_schema.items():
+        if col not in table_schema or sql_type not in table_schema[col]:
+            logging.warning(f"Schema mismatch for `{table_name}`: `{col}` expected `{sql_type}`, found `{table_schema.get(col, 'MISSING')}`")
+
+# Main execution
+try:
+    conn = create_connection()
+    cursor = conn.cursor()
+    logging.info("Database connection established.")
+
+    for csv_file, table_name in csv_files:
+        file_path = os.path.join(folder_path, csv_file)
+        
+        # Check if the file exists
+        if not os.path.exists(file_path):
+            logging.warning(f"File not found: {file_path}")
+            continue
+
+        # Read the CSV file into a pandas DataFrame
+        df = pd.read_csv(file_path)
+        df = df.where(pd.notnull(df), None)
+        df.columns = [col.replace(' ', '_').replace('-', '_').replace('.', '_') for col in df.columns]
+
+        # Generate CREATE TABLE statement
+        columns = ', '.join([f'`{col}` {get_sql_type(df[col].dtype)}' for col in df.columns])
+        create_table_query = f'CREATE TABLE IF NOT EXISTS `{table_name}` ({columns})'
+        
+        try:
+            cursor.execute(create_table_query)
+            validate_table_schema(cursor, table_name, df)
+
+            # Insert data in batches
+            batch_size = 1000
+            insert_query = f"INSERT INTO `{table_name}` ({', '.join(['`' + col + '`' for col in df.columns])}) VALUES ({', '.join(['%s'] * len(df.columns))})"
+            data = [tuple(None if pd.isna(x) else x for x in row) for _, row in df.iterrows()]
+
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i + batch_size]
+                cursor.executemany(insert_query, batch)
+                logging.info(f"Inserted batch {i // batch_size + 1} into `{table_name}`.")
+
+            conn.commit()
+            logging.info(f"Table `{table_name}` processed successfully.")
+        except mysql.connector.Error as err:
+            logging.error(f"Error with table `{table_name}`: {err}")
+            conn.rollback()
+except mysql.connector.Error as conn_err:
+    logging.critical(f"Database connection error: {conn_err}")
+finally:
+    if 'cursor' in locals() and cursor:
+        cursor.close()
+    if 'conn' in locals() and conn:
+        conn.close()
+    logging.info("Database connection closed.")
